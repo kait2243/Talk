@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TokenTransactionType {
+  QR_REDEEM
+  VIDEO_CALL_DEBIT
+  EXPIRED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  tokenBalance Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  transactions TokenTransaction[]
+  usedQRCodes  UsedQRCode[]
+
+  @@index([email])
+}
+
+model TokenTransaction {
+  id        String                @id @default(cuid())
+  userId    String
+  amount    Int
+  type      TokenTransactionType
+  createdAt DateTime              @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model UsedQRCode {
+  id        String   @id @default(cuid())
+  qrHash    String   @unique
+  userId    String
+  scannedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
