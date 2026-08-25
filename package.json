@@ -12,6 +12,7 @@
     "prisma:migrate": "prisma migrate dev"
   },
   "dependencies": {
+    "@fastify/static": "^7.0.4",
     "@fastify/websocket": "^10.0.1",
     "@prisma/client": "^5.19.1",
     "fastify": "^4.28.1",

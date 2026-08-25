@@ -91,6 +91,7 @@
           </div>
 
           <div class="relative aspect-[3/4] rounded-xl overflow-hidden bg-slate-800 ring-1 ring-slate-700">
+            <video id="strangerVideo" autoplay playsinline class="h-full w-full object-cover hidden"></video>
             <div id="strangerFeed" class="absolute inset-0 flex items-center justify-center text-center px-3">
               <p id="strangerFeedLabel" class="text-xs text-slate-500">Not connected</p>
             </div>
@@ -144,6 +145,8 @@
     constructor() {
       this.ws = null;
       this.localStream = null;
+      this.pc = null;
+      this.pendingRemoteCandidates = [];
       this.sessionId = null;
       this.peerId = null;
       this.turnUrl = null;
@@ -171,6 +174,7 @@
         nextMatchBtn: document.getElementById("nextMatchBtn"),
         localVideo: document.getElementById("localVideo"),
         localPlaceholder: document.getElementById("localPlaceholder"),
+        strangerVideo: document.getElementById("strangerVideo"),
         strangerFeed: document.getElementById("strangerFeed"),
         strangerFeedLabel: document.getElementById("strangerFeedLabel"),
         strangerLoader: document.getElementById("strangerLoader"),
@@ -408,15 +412,137 @@
           this._onPeerDisconnected();
           break;
         case "OFFER":
+          this._onRemoteOffer(payload.sdp);
+          break;
         case "ANSWER":
+          this._onRemoteAnswer(payload.sdp);
+          break;
         case "ICE_CANDIDATE":
-          // WebRTC peer-connection wiring lands in a later step; for now
-          // just surface that signaling traffic is flowing.
-          this.log(`Received ${payload.action} from peer (relay only, not yet applied).`);
+          this._onRemoteIceCandidate(payload.candidate);
           break;
         default:
           this.log(`Unhandled action: ${payload.action}`);
       }
+    }
+
+    _sendSignal(payload) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(payload));
+      }
+    }
+
+    /** Decodes the (unverified, client-trusted) userId out of our own JWT for initiator tie-breaking. */
+    _getMyUserId() {
+      try {
+        const parts = this.accessToken.split(".");
+        if (parts.length !== 3) return null;
+        const json = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+        return typeof json.userId === "string" ? json.userId : null;
+      } catch {
+        return null;
+      }
+    }
+
+    _initPeerConnection() {
+      this._teardownPeerConnection();
+
+      const iceServers = this.turnUrl ? [{ urls: this.turnUrl }] : [];
+      this.pc = new RTCPeerConnection({ iceServers });
+
+      if (this.localStream) {
+        this.localStream.getTracks().forEach((track) => this.pc.addTrack(track, this.localStream));
+      }
+
+      this.pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          this._sendSignal({ action: "ICE_CANDIDATE", candidate: event.candidate });
+        }
+      };
+
+      this.pc.ontrack = (event) => {
+        this.dom.strangerVideo.srcObject = event.streams[0];
+        this.dom.strangerVideo.classList.remove("hidden");
+        this.dom.strangerFeed.classList.remove("mock-transmitting");
+        this.dom.strangerFeed.classList.add("hidden");
+        this.log("Remote track received — live stranger video attached.");
+      };
+
+      this.pc.onconnectionstatechange = () => {
+        this.log(`RTCPeerConnection state: ${this.pc.connectionState}`);
+      };
+    }
+
+    async _flushPendingCandidates() {
+      const queued = this.pendingRemoteCandidates.splice(0);
+      for (const candidate of queued) {
+        try {
+          await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          this.log(`Failed to add queued ICE candidate: ${err.message}`);
+        }
+      }
+    }
+
+    async _createAndSendOffer() {
+      try {
+        const offer = await this.pc.createOffer();
+        await this.pc.setLocalDescription(offer);
+        this._sendSignal({ action: "OFFER", sdp: this.pc.localDescription });
+        this.log("Sent OFFER as initiator.");
+      } catch (err) {
+        this.log(`Failed to create offer: ${err.message}`);
+      }
+    }
+
+    async _onRemoteOffer(sdp) {
+      if (!this.pc) this._initPeerConnection();
+      try {
+        await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        await this._flushPendingCandidates();
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        this._sendSignal({ action: "ANSWER", sdp: this.pc.localDescription });
+        this.log("Received OFFER, sent ANSWER.");
+      } catch (err) {
+        this.log(`Failed to handle remote offer: ${err.message}`);
+      }
+    }
+
+    async _onRemoteAnswer(sdp) {
+      if (!this.pc) return;
+      try {
+        await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        await this._flushPendingCandidates();
+        this.log("Received ANSWER — connection negotiating.");
+      } catch (err) {
+        this.log(`Failed to handle remote answer: ${err.message}`);
+      }
+    }
+
+    async _onRemoteIceCandidate(candidate) {
+      if (!candidate) return;
+      if (!this.pc || !this.pc.remoteDescription) {
+        this.pendingRemoteCandidates.push(candidate);
+        return;
+      }
+      try {
+        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        this.log(`Failed to add ICE candidate: ${err.message}`);
+      }
+    }
+
+    _teardownPeerConnection() {
+      if (this.pc) {
+        this.pc.onicecandidate = null;
+        this.pc.ontrack = null;
+        this.pc.onconnectionstatechange = null;
+        this.pc.close();
+        this.pc = null;
+      }
+      this.pendingRemoteCandidates = [];
+      this.dom.strangerVideo.srcObject = null;
+      this.dom.strangerVideo.classList.add("hidden");
     }
 
     _onMatchFound(payload) {
@@ -427,6 +553,7 @@
       this.setStatus("connected");
       this._showStrangerLoader(false);
 
+      this.dom.strangerFeed.classList.remove("hidden");
       this.dom.strangerFeed.classList.add("mock-transmitting");
       this.dom.strangerFeedLabel.textContent = "";
       this.dom.strangerFeedLabel.classList.add("hidden");
@@ -437,13 +564,25 @@
 
       this.log(`MATCH_FOUND — peer=${this.peerId} session=${this.sessionId} turn=${this.turnUrl}`);
       this.showToast("Stranger connected!", "success");
+
+      this._initPeerConnection();
+
+      const myUserId = this._getMyUserId();
+      const isInitiator = Boolean(myUserId && this.peerId && myUserId < this.peerId);
+      this.log(`WebRTC role: ${isInitiator ? "initiator (sending OFFER)" : "responder (awaiting OFFER)"}`);
+
+      if (isInitiator) {
+        this._createAndSendOffer();
+      }
     }
 
     _onPeerDisconnected() {
       this.showToast("Your match disconnected.", "warn");
       this.log("PEER_DISCONNECTED — clearing viewport and re-queuing.");
 
+      this._teardownPeerConnection();
       this.dom.strangerFeed.classList.remove("mock-transmitting");
+      this.dom.strangerFeed.classList.remove("hidden");
       this.dom.strangerFeedLabel.classList.remove("hidden");
       this.dom.strangerFeedLabel.textContent = "Not connected";
       this.dom.sessionMeta.classList.add("hidden");
@@ -475,7 +614,9 @@
 
     nextMatch() {
       this.log("Next Match requested by user.");
+      this._teardownPeerConnection();
       this.dom.strangerFeed.classList.remove("mock-transmitting");
+      this.dom.strangerFeed.classList.remove("hidden");
       this.dom.strangerFeedLabel.classList.remove("hidden");
       this.dom.strangerFeedLabel.textContent = "Not connected";
       this.dom.sessionMeta.classList.add("hidden");
@@ -496,6 +637,7 @@
     disconnect() {
       this.log("Disconnected by user.");
       this._teardownSocket();
+      this._teardownPeerConnection();
 
       if (this.localStream) {
         this.localStream.getTracks().forEach((track) => track.stop());
@@ -505,6 +647,7 @@
       }
 
       this.dom.strangerFeed.classList.remove("mock-transmitting");
+      this.dom.strangerFeed.classList.remove("hidden");
       this.dom.strangerFeedLabel.classList.remove("hidden");
       this.dom.strangerFeedLabel.textContent = "Not connected";
       this.dom.sessionMeta.classList.add("hidden");

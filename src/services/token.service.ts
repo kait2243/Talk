@@ -71,13 +71,17 @@ export async function deductTokensForSession(
  * even under concurrent duplicate scans (the losing transaction fails on the
  * unique violation and is treated as an already-used code).
  */
+export type RedeemQrCodeResult =
+  | { success: true; tokenBalance: number }
+  | { success: false; reason: "ALREADY_USED" | "USER_NOT_FOUND" };
+
 export async function redeemQrCode(
   userId: string,
   qrHash: string,
   creditAmount: number
-): Promise<{ success: boolean; reason?: "ALREADY_USED" }> {
+): Promise<RedeemQrCodeResult> {
   try {
-    await prisma.$transaction(async (tx) => {
+    const tokenBalance = await prisma.$transaction(async (tx) => {
       await tx.usedQRCode.create({
         data: { qrHash, userId },
       });
@@ -90,19 +94,25 @@ export async function redeemQrCode(
         },
       });
 
-      await tx.user.update({
+      const updated = await tx.user.update({
         where: { id: userId },
         data: { tokenBalance: { increment: creditAmount } },
       });
+
+      return updated.tokenBalance;
     });
 
-    return { success: true };
+    return { success: true, tokenBalance };
   } catch (err) {
-    if (
-      err instanceof Prisma.PrismaClientKnownRequestError &&
-      err.code === "P2002"
-    ) {
-      return { success: false, reason: "ALREADY_USED" };
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      if (err.code === "P2002") {
+        return { success: false, reason: "ALREADY_USED" };
+      }
+      // P2003: foreign key violation (userId doesn't exist).
+      // P2025: related record required for the update was not found.
+      if (err.code === "P2003" || err.code === "P2025") {
+        return { success: false, reason: "USER_NOT_FOUND" };
+      }
     }
     throw err;
   }
