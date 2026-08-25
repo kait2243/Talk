@@ -1,7 +1,9 @@
 import { FastifyPluginAsync } from "fastify";
 import type WebSocket from "ws";
+import { randomUUID } from "crypto";
 import jwt from "jsonwebtoken";
 import { prisma } from "../lib/prisma";
+import { provisionEphemeralTurnServer } from "../services/cloud.service";
 
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 const MIN_TOKEN_BALANCE_TO_MATCH = 5;
@@ -11,24 +13,60 @@ const WS_CLOSE_USER_NOT_FOUND = 4002;
 const WS_CLOSE_INSUFFICIENT_BALANCE = 4003;
 const WS_CLOSE_ALREADY_CONNECTED = 4004;
 
+const RELAYED_ACTIONS = new Set(["OFFER", "ANSWER", "ICE_CANDIDATE"]);
+
 interface MatchJoinJwtPayload {
   userId: string;
+}
+
+interface Session {
+  userA: string;
+  userB: string;
 }
 
 // Ordered FIFO queue of userIds currently waiting for a peer.
 const matchingPool: string[] = [];
 
 // Live socket handle for every userId currently connected to /v1/matching/join.
-// Kept alongside the array queue so a match can be delivered to both peers
-// and so a disconnect can be spliced out of matchingPool in O(n) worst case
-// (bounded by pool size, which is small relative to total connections).
 const activeConnections = new Map<string, WebSocket>();
+
+// Live WebRTC signaling sessions, keyed by sessionId.
+const activeSessions = new Map<string, Session>();
+
+// Reverse lookup so an inbound message or a disconnect can find the session
+// a given userId currently belongs to without scanning activeSessions.
+const userSessionMap = new Map<string, string>();
 
 function removeFromPool(userId: string): void {
   const idx = matchingPool.indexOf(userId);
   if (idx !== -1) {
     matchingPool.splice(idx, 1);
   }
+}
+
+function getPeerId(session: Session, userId: string): string {
+  return session.userA === userId ? session.userB : session.userA;
+}
+
+function teardownSession(userId: string): void {
+  const sessionId = userSessionMap.get(userId);
+  if (!sessionId) return;
+
+  const session = activeSessions.get(sessionId);
+  if (!session) {
+    userSessionMap.delete(userId);
+    return;
+  }
+
+  const peerId = getPeerId(session, userId);
+  const peerSocket = activeConnections.get(peerId);
+  if (peerSocket && peerSocket.readyState === peerSocket.OPEN) {
+    peerSocket.send(JSON.stringify({ action: "PEER_DISCONNECTED" }));
+  }
+
+  activeSessions.delete(sessionId);
+  userSessionMap.delete(session.userA);
+  userSessionMap.delete(session.userB);
 }
 
 function verifyToken(token: string | undefined): MatchJoinJwtPayload | null {
@@ -85,14 +123,45 @@ const matchingPlugin: FastifyPluginAsync = async (fastify) => {
 
       activeConnections.set(userId, socket);
 
-      socket.on("close", () => {
+      const cleanup = () => {
         removeFromPool(userId);
+        teardownSession(userId);
         activeConnections.delete(userId);
-      });
+      };
 
-      socket.on("error", () => {
-        removeFromPool(userId);
-        activeConnections.delete(userId);
+      socket.on("close", cleanup);
+      socket.on("error", cleanup);
+
+      socket.on("message", (raw) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw.toString());
+        } catch {
+          return;
+        }
+
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          typeof (parsed as Record<string, unknown>).action !== "string"
+        ) {
+          return;
+        }
+
+        const { action } = parsed as { action: string };
+        if (!RELAYED_ACTIONS.has(action)) return;
+
+        const sessionId = userSessionMap.get(userId);
+        if (!sessionId) return;
+
+        const session = activeSessions.get(sessionId);
+        if (!session) return;
+
+        const peerId = getPeerId(session, userId);
+        const peerSocket = activeConnections.get(peerId);
+        if (!peerSocket || peerSocket.readyState !== peerSocket.OPEN) return;
+
+        peerSocket.send(JSON.stringify(parsed));
       });
 
       // Pair with the oldest still-connected waiting user, if any, skipping
@@ -112,8 +181,26 @@ const matchingPlugin: FastifyPluginAsync = async (fastify) => {
       }
 
       if (peerId && peerSocket) {
-        socket.send(JSON.stringify({ action: "MATCH_FOUND", peerId }));
-        peerSocket.send(JSON.stringify({ action: "MATCH_FOUND", peerId: userId }));
+        const sessionId = randomUUID();
+        activeSessions.set(sessionId, { userA: peerId, userB: userId });
+        userSessionMap.set(peerId, sessionId);
+        userSessionMap.set(userId, sessionId);
+
+        const { turnUrl } = await provisionEphemeralTurnServer(sessionId);
+
+        // Re-check liveness: either side may have dropped during the
+        // provisioning delay.
+        if (peerSocket.readyState !== peerSocket.OPEN || socket.readyState !== socket.OPEN) {
+          teardownSession(userId);
+          return;
+        }
+
+        socket.send(
+          JSON.stringify({ action: "MATCH_FOUND", peerId, sessionId, turnUrl })
+        );
+        peerSocket.send(
+          JSON.stringify({ action: "MATCH_FOUND", peerId: userId, sessionId, turnUrl })
+        );
       } else {
         matchingPool.push(userId);
       }
