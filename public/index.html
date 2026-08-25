@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Talk — Token-Gated Video Chat</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { -webkit-tap-highlight-color: transparent; }
+  #toastStack > * { animation: toast-in 200ms ease-out; }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(-8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes mock-signal {
+    0%, 100% { filter: hue-rotate(0deg) brightness(1); }
+    50%      { filter: hue-rotate(35deg) brightness(1.15); }
+  }
+  .mock-transmitting {
+    animation: mock-signal 2.4s ease-in-out infinite;
+    background: linear-gradient(135deg, #6366f1, #ec4899, #22d3ee);
+    background-size: 200% 200%;
+  }
+  .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.4); border-radius: 9999px; }
+</style>
+</head>
+<body class="h-full bg-slate-950 text-slate-100 antialiased">
+
+  <div id="toastStack" class="fixed top-3 inset-x-0 z-50 flex flex-col items-center gap-2 px-4 pointer-events-none"></div>
+
+  <div class="mx-auto flex h-full min-h-screen w-full max-w-md flex-col pb-28">
+
+    <header class="sticky top-0 z-30 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <div class="h-8 w-8 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-400 flex items-center justify-center font-bold text-sm">T</div>
+        <span class="font-semibold tracking-tight">Talk</span>
+      </div>
+      <div id="statusPill" class="flex items-center gap-1.5 rounded-full bg-slate-800 px-3 py-1 text-xs font-medium text-slate-300">
+        <span id="statusDot" class="h-1.5 w-1.5 rounded-full bg-slate-500"></span>
+        <span id="statusLabel">Idle</span>
+      </div>
+    </header>
+
+    <main class="flex-1 px-4 py-4 space-y-4">
+
+      <!-- Wallet Status Card -->
+      <section class="rounded-2xl bg-gradient-to-br from-indigo-600/20 to-slate-900 border border-indigo-500/20 p-4 shadow-lg shadow-indigo-950/40">
+        <div class="flex items-start justify-between">
+          <div>
+            <p class="text-xs uppercase tracking-wide text-indigo-300/80">Wallet Status</p>
+            <p class="mt-1 text-3xl font-bold tabular-nums" id="tokenBalance">0</p>
+            <p class="text-xs text-slate-400">tokens available</p>
+          </div>
+          <button id="redeemBtn"
+            class="rounded-xl bg-indigo-500 hover:bg-indigo-400 active:scale-95 transition px-3 py-2 text-xs font-semibold shadow shadow-indigo-900/50">
+            + Redeem QR
+          </button>
+        </div>
+
+        <div class="mt-4">
+          <p class="text-xs font-medium text-slate-400 mb-1.5">Transaction Ledger</p>
+          <div id="ledger" class="scrollbar-thin max-h-32 overflow-y-auto space-y-1.5 pr-1">
+            <p class="text-xs text-slate-500 italic">No transactions yet.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Interests / Quick Connect -->
+      <section class="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+        <p class="text-xs uppercase tracking-wide text-slate-400 mb-2">Interests / Quick Connect</p>
+        <div id="interestChips" class="flex flex-wrap gap-2 mb-3">
+          <!-- populated by JS -->
+        </div>
+        <button id="startMatchingBtn"
+          class="w-full rounded-xl bg-cyan-500 hover:bg-cyan-400 active:scale-[0.98] transition py-2.5 text-sm font-semibold text-slate-950 shadow shadow-cyan-900/40 disabled:opacity-40 disabled:cursor-not-allowed">
+          Start Matching
+        </button>
+      </section>
+
+      <!-- Omegle Viewport -->
+      <section class="rounded-2xl bg-slate-900 border border-slate-800 p-3">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+
+          <div class="relative aspect-[3/4] rounded-xl overflow-hidden bg-slate-800 ring-1 ring-slate-700">
+            <video id="localVideo" autoplay muted playsinline class="h-full w-full object-cover"></video>
+            <div id="localPlaceholder" class="absolute inset-0 flex items-center justify-center text-slate-500 text-xs">
+              Camera off
+            </div>
+            <span class="absolute bottom-2 left-2 rounded-md bg-black/60 px-2 py-0.5 text-[11px] font-medium">You</span>
+          </div>
+
+          <div class="relative aspect-[3/4] rounded-xl overflow-hidden bg-slate-800 ring-1 ring-slate-700">
+            <div id="strangerFeed" class="absolute inset-0 flex items-center justify-center text-center px-3">
+              <p id="strangerFeedLabel" class="text-xs text-slate-500">Not connected</p>
+            </div>
+            <div id="strangerLoader" class="absolute inset-0 hidden flex-col items-center justify-center gap-2 bg-slate-900/80">
+              <span class="h-6 w-6 rounded-full border-2 border-slate-600 border-t-cyan-400 animate-spin"></span>
+              <p class="text-xs text-slate-400">Looking for new match…</p>
+            </div>
+            <span class="absolute bottom-2 left-2 rounded-md bg-black/60 px-2 py-0.5 text-[11px] font-medium">Stranger</span>
+          </div>
+
+        </div>
+
+        <div id="sessionMeta" class="mt-3 hidden rounded-lg bg-slate-950/60 border border-slate-800 px-3 py-2 text-[11px] font-mono text-slate-400 space-y-0.5 break-all">
+          <p><span class="text-slate-500">session:</span> <span id="sessionIdLabel">—</span></p>
+          <p><span class="text-slate-500">turn:</span> <span id="turnUrlLabel">—</span></p>
+        </div>
+      </section>
+
+      <!-- Activity Log -->
+      <section class="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+        <p class="text-xs uppercase tracking-wide text-slate-400 mb-2">Activity Log</p>
+        <div id="activityLog" class="scrollbar-thin max-h-28 overflow-y-auto space-y-1 text-[11px] text-slate-500 font-mono">
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Persistent Control Bar -->
+    <div class="fixed bottom-0 inset-x-0 z-30 border-t border-slate-800 bg-slate-950/95 backdrop-blur">
+      <div class="mx-auto max-w-md px-4 py-3 flex items-center gap-3">
+        <button id="disconnectBtn" disabled
+          class="flex-1 rounded-xl bg-red-600 hover:bg-red-500 active:scale-[0.98] transition py-3 text-sm font-semibold shadow shadow-red-950/50 disabled:opacity-30 disabled:cursor-not-allowed">
+          Disconnect
+        </button>
+        <button id="nextMatchBtn" disabled
+          class="flex-1 rounded-xl bg-blue-600 hover:bg-blue-500 active:scale-[0.98] transition py-3 text-sm font-semibold shadow shadow-blue-950/50 disabled:opacity-30 disabled:cursor-not-allowed">
+          Next Match
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  const INTERESTS = ["Music", "Gaming", "Movies", "Tech", "Travel", "Sports"];
+
+  class TokenGatedAppManager {
+    constructor() {
+      this.ws = null;
+      this.localStream = null;
+      this.sessionId = null;
+      this.peerId = null;
+      this.turnUrl = null;
+      this.selectedInterests = new Set();
+      this.tokenBalance = Number(localStorage.getItem("demo_token_balance") ?? 20);
+      this.transactions = JSON.parse(localStorage.getItem("demo_transactions") ?? "[]");
+      this.accessToken = localStorage.getItem("demo_access_token") ?? "";
+
+      this._cacheDom();
+      this._bindEvents();
+      this._renderInterests();
+      this._renderWallet();
+      this._renderLedger();
+      this.setStatus("idle");
+    }
+
+    _cacheDom() {
+      this.dom = {
+        tokenBalance: document.getElementById("tokenBalance"),
+        ledger: document.getElementById("ledger"),
+        redeemBtn: document.getElementById("redeemBtn"),
+        interestChips: document.getElementById("interestChips"),
+        startMatchingBtn: document.getElementById("startMatchingBtn"),
+        disconnectBtn: document.getElementById("disconnectBtn"),
+        nextMatchBtn: document.getElementById("nextMatchBtn"),
+        localVideo: document.getElementById("localVideo"),
+        localPlaceholder: document.getElementById("localPlaceholder"),
+        strangerFeed: document.getElementById("strangerFeed"),
+        strangerFeedLabel: document.getElementById("strangerFeedLabel"),
+        strangerLoader: document.getElementById("strangerLoader"),
+        sessionMeta: document.getElementById("sessionMeta"),
+        sessionIdLabel: document.getElementById("sessionIdLabel"),
+        turnUrlLabel: document.getElementById("turnUrlLabel"),
+        statusDot: document.getElementById("statusDot"),
+        statusLabel: document.getElementById("statusLabel"),
+        activityLog: document.getElementById("activityLog"),
+        toastStack: document.getElementById("toastStack"),
+      };
+    }
+
+    _bindEvents() {
+      this.dom.redeemBtn.addEventListener("click", () => {
+        const codeHash = `demo-qr-${Math.random().toString(36).slice(2, 10)}`;
+        this.redeemQRCode(codeHash);
+      });
+      this.dom.startMatchingBtn.addEventListener("click", () => this.startMatching());
+      this.dom.disconnectBtn.addEventListener("click", () => this.disconnect());
+      this.dom.nextMatchBtn.addEventListener("click", () => this.nextMatch());
+    }
+
+    _renderInterests() {
+      this.dom.interestChips.innerHTML = "";
+      INTERESTS.forEach((interest) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.textContent = interest;
+        chip.className =
+          "rounded-full border border-slate-700 px-3 py-1 text-xs font-medium text-slate-300 hover:border-cyan-400 transition";
+        chip.addEventListener("click", () => {
+          if (this.selectedInterests.has(interest)) {
+            this.selectedInterests.delete(interest);
+            chip.classList.remove("bg-cyan-500", "text-slate-950", "border-cyan-400");
+          } else {
+            this.selectedInterests.add(interest);
+            chip.classList.add("bg-cyan-500", "text-slate-950", "border-cyan-400");
+          }
+        });
+        this.dom.interestChips.appendChild(chip);
+      });
+    }
+
+    _renderWallet() {
+      this.dom.tokenBalance.textContent = this.tokenBalance.toLocaleString();
+      localStorage.setItem("demo_token_balance", String(this.tokenBalance));
+    }
+
+    _renderLedger() {
+      localStorage.setItem("demo_transactions", JSON.stringify(this.transactions.slice(0, 50)));
+
+      if (this.transactions.length === 0) {
+        this.dom.ledger.innerHTML = '<p class="text-xs text-slate-500 italic">No transactions yet.</p>';
+        return;
+      }
+
+      this.dom.ledger.innerHTML = this.transactions
+        .slice(0, 50)
+        .map((tx) => {
+          const positive = tx.amount > 0;
+          const sign = positive ? "+" : "";
+          const color = positive ? "text-emerald-400" : "text-red-400";
+          const time = new Date(tx.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          return `
+            <div class="flex items-center justify-between rounded-lg bg-slate-950/50 px-2.5 py-1.5">
+              <div>
+                <p class="text-xs font-medium">${tx.type}</p>
+                <p class="text-[10px] text-slate-500">${time}</p>
+              </div>
+              <p class="text-xs font-semibold tabular-nums ${color}">${sign}${tx.amount}</p>
+            </div>`;
+        })
+        .join("");
+    }
+
+    _addTransaction(type, amount) {
+      this.transactions.unshift({ type, amount, createdAt: new Date().toISOString() });
+      this._renderLedger();
+    }
+
+    log(message) {
+      const el = document.createElement("p");
+      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      el.textContent = `[${time}] ${message}`;
+      this.dom.activityLog.prepend(el);
+      while (this.dom.activityLog.children.length > 30) {
+        this.dom.activityLog.removeChild(this.dom.activityLog.lastChild);
+      }
+    }
+
+    showToast(message, variant = "info") {
+      const colors = {
+        info: "bg-slate-800 text-slate-100 border-slate-700",
+        success: "bg-emerald-600/90 text-white border-emerald-400/40",
+        error: "bg-red-600/90 text-white border-red-400/40",
+        warn: "bg-amber-500/90 text-slate-950 border-amber-300/40",
+      };
+      const toast = document.createElement("div");
+      toast.className = `pointer-events-auto rounded-xl border px-4 py-2 text-xs font-medium shadow-lg ${colors[variant] || colors.info}`;
+      toast.textContent = message;
+      this.dom.toastStack.appendChild(toast);
+      setTimeout(() => {
+        toast.style.transition = "opacity 200ms ease";
+        toast.style.opacity = "0";
+        setTimeout(() => toast.remove(), 200);
+      }, 3200);
+    }
+
+    setStatus(status) {
+      this.status = status;
+      const map = {
+        idle: { label: "Idle", dot: "bg-slate-500" },
+        searching: { label: "Searching…", dot: "bg-amber-400 animate-pulse" },
+        connected: { label: "Connected", dot: "bg-emerald-400" },
+      };
+      const cfg = map[status] || map.idle;
+      this.dom.statusLabel.textContent = cfg.label;
+      this.dom.statusDot.className = `h-1.5 w-1.5 rounded-full ${cfg.dot}`;
+
+      this.dom.disconnectBtn.disabled = status === "idle";
+      this.dom.nextMatchBtn.disabled = status === "idle";
+      this.dom.startMatchingBtn.disabled = status !== "idle";
+    }
+
+    // --- Wallet -------------------------------------------------------
+
+    /**
+     * Mocked QR redemption. Shaped like the real call to POST /v1/wallet/redeem
+     * (which is not wired up on the backend yet), falling back to a purely
+     * local balance bump so the UI flow is demoable end-to-end.
+     */
+    async redeemQRCode(codeHash) {
+      this.dom.redeemBtn.disabled = true;
+      this.log(`Redeeming QR code ${codeHash}…`);
+
+      try {
+        const response = await fetch("/v1/wallet/redeem", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+          },
+          body: JSON.stringify({ qrHash: codeHash }),
+        });
+
+        if (!response.ok) throw new Error(`redeem endpoint responded ${response.status}`);
+
+        const data = await response.json();
+        this.tokenBalance = data.tokenBalance;
+        this._addTransaction("QR_REDEEM", data.amount ?? 10);
+        this._renderWallet();
+        this.showToast(`+${data.amount ?? 10} tokens redeemed`, "success");
+      } catch (err) {
+        // Backend route not available in this prototype — simulate the credit locally.
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        const mockAmount = 10;
+        this.tokenBalance += mockAmount;
+        this._addTransaction("QR_REDEEM", mockAmount);
+        this._renderWallet();
+        this.showToast(`+${mockAmount} tokens redeemed (mock)`, "success");
+        this.log(`QR redemption mocked locally: ${err.message}`);
+      } finally {
+        this.dom.redeemBtn.disabled = false;
+      }
+    }
+
+    // --- Matching / Signaling ------------------------------------------
+
+    async startMatching() {
+      if (this.tokenBalance < 5) {
+        this.showToast("You need at least 5 tokens to start matching.", "error");
+        return;
+      }
+
+      await this._ensureLocalCamera();
+      this.setStatus("searching");
+      this._showStrangerLoader(true);
+      this._connectSocket();
+    }
+
+    async _ensureLocalCamera() {
+      if (this.localStream) return;
+      try {
+        this.localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        this.dom.localVideo.srcObject = this.localStream;
+        this.dom.localPlaceholder.classList.add("hidden");
+        this.log("Local camera preview started.");
+      } catch (err) {
+        this.log(`Camera unavailable: ${err.message}`);
+        this.showToast("Camera/mic permission denied — continuing without preview.", "warn");
+      }
+    }
+
+    _connectSocket() {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const token = encodeURIComponent(this.accessToken || "demo-token");
+      const url = `${protocol}://${window.location.host}/v1/matching/join?token=${token}`;
+
+      this.ws = new WebSocket(url);
+
+      this.ws.addEventListener("open", () => {
+        this.log("Signaling socket connected, waiting in matching pool…");
+      });
+
+      this.ws.addEventListener("message", (event) => this._handleSocketMessage(event));
+
+      this.ws.addEventListener("close", (event) => {
+        this.log(`Signaling socket closed (code ${event.code}).`);
+        if (this.status !== "idle") {
+          this._resetToSearchingOrIdle();
+        }
+      });
+
+      this.ws.addEventListener("error", () => {
+        this.showToast("Connection error while matching.", "error");
+      });
+    }
+
+    _handleSocketMessage(event) {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      switch (payload.action) {
+        case "MATCH_FOUND":
+          this._onMatchFound(payload);
+          break;
+        case "PEER_DISCONNECTED":
+          this._onPeerDisconnected();
+          break;
+        case "OFFER":
+        case "ANSWER":
+        case "ICE_CANDIDATE":
+          // WebRTC peer-connection wiring lands in a later step; for now
+          // just surface that signaling traffic is flowing.
+          this.log(`Received ${payload.action} from peer (relay only, not yet applied).`);
+          break;
+        default:
+          this.log(`Unhandled action: ${payload.action}`);
+      }
+    }
+
+    _onMatchFound(payload) {
+      this.sessionId = payload.sessionId;
+      this.peerId = payload.peerId;
+      this.turnUrl = payload.turnUrl;
+
+      this.setStatus("connected");
+      this._showStrangerLoader(false);
+
+      this.dom.strangerFeed.classList.add("mock-transmitting");
+      this.dom.strangerFeedLabel.textContent = "";
+      this.dom.strangerFeedLabel.classList.add("hidden");
+
+      this.dom.sessionMeta.classList.remove("hidden");
+      this.dom.sessionIdLabel.textContent = this.sessionId ?? "—";
+      this.dom.turnUrlLabel.textContent = this.turnUrl ?? "—";
+
+      this.log(`MATCH_FOUND — peer=${this.peerId} session=${this.sessionId} turn=${this.turnUrl}`);
+      this.showToast("Stranger connected!", "success");
+    }
+
+    _onPeerDisconnected() {
+      this.showToast("Your match disconnected.", "warn");
+      this.log("PEER_DISCONNECTED — clearing viewport and re-queuing.");
+
+      this.dom.strangerFeed.classList.remove("mock-transmitting");
+      this.dom.strangerFeedLabel.classList.remove("hidden");
+      this.dom.strangerFeedLabel.textContent = "Not connected";
+      this.dom.sessionMeta.classList.add("hidden");
+      this.dom.sessionIdLabel.textContent = "—";
+      this.dom.turnUrlLabel.textContent = "—";
+
+      this.sessionId = null;
+      this.peerId = null;
+      this.turnUrl = null;
+
+      this.setStatus("searching");
+      this._showStrangerLoader(true);
+
+      // The server already dropped our old session; open a fresh socket to re-enter the pool.
+      this._teardownSocket();
+      this._connectSocket();
+    }
+
+    _resetToSearchingOrIdle() {
+      if (this.status === "connected") {
+        this._onPeerDisconnected();
+      }
+    }
+
+    _showStrangerLoader(show) {
+      this.dom.strangerLoader.classList.toggle("hidden", !show);
+      this.dom.strangerLoader.classList.toggle("flex", show);
+    }
+
+    nextMatch() {
+      this.log("Next Match requested by user.");
+      this.dom.strangerFeed.classList.remove("mock-transmitting");
+      this.dom.strangerFeedLabel.classList.remove("hidden");
+      this.dom.strangerFeedLabel.textContent = "Not connected";
+      this.dom.sessionMeta.classList.add("hidden");
+
+      this.sessionId = null;
+      this.peerId = null;
+      this.turnUrl = null;
+
+      this.setStatus("searching");
+      this._showStrangerLoader(true);
+
+      // Closing triggers PEER_DISCONNECTED for the old peer server-side;
+      // reconnecting re-enters the matching pool for a new pairing.
+      this._teardownSocket();
+      this._connectSocket();
+    }
+
+    disconnect() {
+      this.log("Disconnected by user.");
+      this._teardownSocket();
+
+      if (this.localStream) {
+        this.localStream.getTracks().forEach((track) => track.stop());
+        this.localStream = null;
+        this.dom.localVideo.srcObject = null;
+        this.dom.localPlaceholder.classList.remove("hidden");
+      }
+
+      this.dom.strangerFeed.classList.remove("mock-transmitting");
+      this.dom.strangerFeedLabel.classList.remove("hidden");
+      this.dom.strangerFeedLabel.textContent = "Not connected";
+      this.dom.sessionMeta.classList.add("hidden");
+      this._showStrangerLoader(false);
+
+      this.sessionId = null;
+      this.peerId = null;
+      this.turnUrl = null;
+
+      this.setStatus("idle");
+    }
+
+    _teardownSocket() {
+      if (this.ws) {
+        this.ws.onclose = null;
+        this.ws.close();
+        this.ws = null;
+      }
+    }
+  }
+
+  window.appManager = new TokenGatedAppManager();
+})();
+</script>
+</body>
+</html>
