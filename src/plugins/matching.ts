@@ -3,7 +3,7 @@ import type WebSocket from "ws";
 import { randomUUID } from "crypto";
 import jwt from "jsonwebtoken";
 import { prisma } from "../lib/prisma";
-import { provisionEphemeralTurnServer } from "../services/cloud.service";
+import { provisionEphemeralTurnServer, destroyEphemeralTurnServer } from "../services/cloud.service";
 
 const JWT_SECRET = process.env.JWT_SECRET ?? "";
 const MIN_TOKEN_BALANCE_TO_MATCH = 5;
@@ -22,6 +22,7 @@ interface MatchJoinJwtPayload {
 interface Session {
   userA: string;
   userB: string;
+  dropletId: string;
 }
 
 // Ordered FIFO queue of userIds currently waiting for a peer.
@@ -67,6 +68,15 @@ function teardownSession(userId: string): void {
   activeSessions.delete(sessionId);
   userSessionMap.delete(session.userA);
   userSessionMap.delete(session.userB);
+
+  // Fire-and-forget: destroy the droplet the instant either side drops so
+  // spend doesn't linger, without blocking socket cleanup on DO API latency.
+  destroyEphemeralTurnServer(session.dropletId).catch((err) => {
+    console.error(
+      `Failed to destroy TURN droplet ${session.dropletId} for session ${sessionId}:`,
+      err
+    );
+  });
 }
 
 function verifyToken(token: string | undefined): MatchJoinJwtPayload | null {
@@ -182,24 +192,73 @@ const matchingPlugin: FastifyPluginAsync = async (fastify) => {
 
       if (peerId && peerSocket) {
         const sessionId = randomUUID();
-        activeSessions.set(sessionId, { userA: peerId, userB: userId });
-        userSessionMap.set(peerId, sessionId);
-        userSessionMap.set(userId, sessionId);
+        const matchedPeerId = peerId;
+        const matchedPeerSocket = peerSocket;
 
-        const { turnUrl } = await provisionEphemeralTurnServer(sessionId);
-
-        // Re-check liveness: either side may have dropped during the
-        // provisioning delay.
-        if (peerSocket.readyState !== peerSocket.OPEN || socket.readyState !== socket.OPEN) {
-          teardownSession(userId);
+        let provisioned;
+        try {
+          provisioned = await provisionEphemeralTurnServer(sessionId);
+        } catch (err) {
+          fastify.log.error(
+            { err, sessionId },
+            "Failed to provision TURN server for match; requeuing both users"
+          );
+          const errorPayload = JSON.stringify({
+            action: "MATCH_ERROR",
+            message: "Failed to provision session infrastructure, retrying…",
+          });
+          if (socket.readyState === socket.OPEN) {
+            socket.send(errorPayload);
+            matchingPool.push(userId);
+          }
+          if (matchedPeerSocket.readyState === matchedPeerSocket.OPEN) {
+            matchedPeerSocket.send(errorPayload);
+            matchingPool.push(matchedPeerId);
+          }
           return;
         }
 
+        // Either side may have dropped during the provisioning round-trip —
+        // don't finalize a session for a socket that's no longer open, and
+        // don't leak the droplet we just paid for.
+        if (matchedPeerSocket.readyState !== matchedPeerSocket.OPEN || socket.readyState !== socket.OPEN) {
+          await destroyEphemeralTurnServer(provisioned.dropletId).catch((err) =>
+            fastify.log.error({ err, dropletId: provisioned.dropletId }, "Failed to destroy orphaned TURN droplet")
+          );
+          if (socket.readyState === socket.OPEN) matchingPool.push(userId);
+          if (matchedPeerSocket.readyState === matchedPeerSocket.OPEN) matchingPool.push(matchedPeerId);
+          return;
+        }
+
+        activeSessions.set(sessionId, {
+          userA: matchedPeerId,
+          userB: userId,
+          dropletId: provisioned.dropletId,
+        });
+        userSessionMap.set(matchedPeerId, sessionId);
+        userSessionMap.set(userId, sessionId);
+
+        const { turnUrl, turnUsername, turnCredential } = provisioned;
+
         socket.send(
-          JSON.stringify({ action: "MATCH_FOUND", peerId, sessionId, turnUrl })
+          JSON.stringify({
+            action: "MATCH_FOUND",
+            peerId: matchedPeerId,
+            sessionId,
+            turnUrl,
+            turnUsername,
+            turnCredential,
+          })
         );
-        peerSocket.send(
-          JSON.stringify({ action: "MATCH_FOUND", peerId: userId, sessionId, turnUrl })
+        matchedPeerSocket.send(
+          JSON.stringify({
+            action: "MATCH_FOUND",
+            peerId: userId,
+            sessionId,
+            turnUrl,
+            turnUsername,
+            turnCredential,
+          })
         );
       } else {
         matchingPool.push(userId);

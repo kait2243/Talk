@@ -150,6 +150,8 @@
       this.sessionId = null;
       this.peerId = null;
       this.turnUrl = null;
+      this.turnUsername = null;
+      this.turnCredential = null;
       this.selectedInterests = new Set();
       this.tokenBalance = Number(localStorage.getItem("demo_token_balance") ?? 20);
       this.transactions = JSON.parse(localStorage.getItem("demo_transactions") ?? "[]");
@@ -446,7 +448,9 @@
     _initPeerConnection() {
       this._teardownPeerConnection();
 
-      const iceServers = this.turnUrl ? [{ urls: this.turnUrl }] : [];
+      const iceServers = this.turnUrl
+        ? [{ urls: this.turnUrl, username: this.turnUsername, credential: this.turnCredential }]
+        : [];
       this.pc = new RTCPeerConnection({ iceServers });
 
       if (this.localStream) {
@@ -549,6 +553,8 @@
       this.sessionId = payload.sessionId;
       this.peerId = payload.peerId;
       this.turnUrl = payload.turnUrl;
+      this.turnUsername = payload.turnUsername;
+      this.turnCredential = payload.turnCredential;
 
       this.setStatus("connected");
       this._showStrangerLoader(false);
@@ -592,6 +598,8 @@
       this.sessionId = null;
       this.peerId = null;
       this.turnUrl = null;
+      this.turnUsername = null;
+      this.turnCredential = null;
 
       this.setStatus("searching");
       this._showStrangerLoader(true);
@@ -624,6 +632,8 @@
       this.sessionId = null;
       this.peerId = null;
       this.turnUrl = null;
+      this.turnUsername = null;
+      this.turnCredential = null;
 
       this.setStatus("searching");
       this._showStrangerLoader(true);
@@ -656,6 +666,8 @@
       this.sessionId = null;
       this.peerId = null;
       this.turnUrl = null;
+      this.turnUsername = null;
+      this.turnCredential = null;
 
       this.setStatus("idle");
     }
